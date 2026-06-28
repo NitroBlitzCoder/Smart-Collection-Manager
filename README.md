@@ -1,4 +1,4 @@
-# Smart Collection Manager
+# Smart Collection Manager (Blender)
 > Stop organizing manually. Let your scene manage itself.
 
 Smart Collection Manager is a Blender addon that automates scene organization. 
