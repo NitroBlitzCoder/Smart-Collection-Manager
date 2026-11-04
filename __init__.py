@@ -1,15 +1,22 @@
 bl_info = {
     "name": "Smart Collection Manager Free",
     "author": "Codex",
-    "version": (1, 0, 0),
-    "blender": (3, 6, 0),
+    "version": (1, 1, 1),
+    "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Scene Tools",
     "description": "Sort objects by type, rename batches, view scene stats, and hide empty collections.",
     "category": "Object",
 }
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, PointerProperty, StringProperty
+from .safety import (
+    SceneOperator, editable, ensure_child, hide_empty,
+    managed_root, move_object, private_collections, restore_hidden, write_report,
+)
+
+
+OWNER = "smart_collection_manager_free"
 
 
 TYPE_COLLECTIONS = {
@@ -23,33 +30,8 @@ TYPE_COLLECTIONS = {
 }
 
 
-def managed_root(scene):
-    root = bpy.data.collections.get("Smart Collections")
-    if root is None:
-        root = bpy.data.collections.new("Smart Collections")
-    if root.name not in [child.name for child in scene.collection.children]:
-        scene.collection.children.link(root)
-    return root
-
-
-def ensure_child(parent, name):
-    collection = bpy.data.collections.get(name)
-    if collection is None:
-        collection = bpy.data.collections.new(name)
-    if collection.name not in [child.name for child in parent.children]:
-        parent.children.link(collection)
-    return collection
-
-
-def target_collection_for(scene, obj):
-    root = managed_root(scene)
-    return ensure_child(root, TYPE_COLLECTIONS.get(obj.type, "Other"))
-
-
-def collection_has_content(collection):
-    if collection.objects:
-        return True
-    return any(collection_has_content(child) for child in collection.children)
+class SCMFREE_HiddenCollection(bpy.types.PropertyGroup):
+    collection: PointerProperty(type=bpy.types.Collection)
 
 
 def scene_stats(scene):
@@ -72,72 +54,95 @@ def apply_rename(obj, scene, index):
     obj.name = name
 
 
-class SCMFREE_OT_sort_by_type(bpy.types.Operator):
+class SCMFREE_OT_sort_by_type(SceneOperator, bpy.types.Operator):
     bl_idname = "smart_collection_free.sort_by_type"
     bl_label = "Sort By Type"
+    bl_options = {"REGISTER", "UNDO"}
     bl_description = "Sort scene objects into Meshes, Lights, Cameras, Curves, Armatures, Empties, and Other"
 
     def execute(self, context):
         scene = context.scene
-        moved = 0
-        managed_names = set(TYPE_COLLECTIONS.values()) | {"Other"}
-        for obj in scene.objects:
-            target = target_collection_for(scene, obj)
-            if obj.name not in [member.name for member in target.objects]:
-                target.objects.link(obj)
-            if scene.scm_exclusive_sort:
-                for collection in list(obj.users_collection):
-                    if collection != target and (collection.name in managed_names or collection.name != scene.collection.name):
-                        try:
-                            collection.objects.unlink(obj)
-                        except RuntimeError:
-                            pass
-            moved += 1
-        self.report({"INFO"}, "Sorted " + str(moved) + " objects.")
+        targets = tuple(scene.objects)
+        private = private_collections(scene)
+        root = None
+        moved = skipped = retained = 0
+        for obj in targets:
+            if not editable(obj):
+                skipped += 1
+                continue
+            try:
+                if root is None:
+                    root = managed_root(scene, OWNER, private)
+                target = ensure_child(root, TYPE_COLLECTIONS.get(obj.type, "Other"), OWNER, private)
+                success, protected = move_object(obj, target, scene.scm_exclusive_sort, private)
+                moved += int(success)
+                retained += protected
+            except RuntimeError:
+                skipped += 1
+        self.report(
+            {"WARNING"} if skipped or retained else {"INFO"},
+            f"Sorted {moved}; skipped {skipped}; retained {retained} protected memberships.",
+        )
         return {"FINISHED"}
 
 
-class SCMFREE_OT_rename_objects(bpy.types.Operator):
+class SCMFREE_OT_rename_objects(SceneOperator, bpy.types.Operator):
     bl_idname = "smart_collection_free.rename_objects"
     bl_label = "Rename Objects"
+    bl_options = {"REGISTER", "UNDO"}
     bl_description = "Apply prefix, suffix, find/replace, and optional numbering"
 
     def execute(self, context):
         scene = context.scene
-        targets = context.selected_objects if scene.scm_rename_selected_only else list(scene.objects)
-        for index, obj in enumerate(targets, start=1):
-            apply_rename(obj, scene, index)
-        self.report({"INFO"}, "Renamed " + str(len(targets)) + " objects.")
+        scene_objects = tuple(scene.objects)
+        members = set(scene_objects)
+        targets = tuple(context.selected_objects) if scene.scm_rename_selected_only else scene_objects
+        renamed = skipped = 0
+        for obj in targets:
+            if obj not in members or not editable(obj):
+                skipped += 1
+                continue
+            try:
+                apply_rename(obj, scene, renamed + 1)
+                renamed += 1
+            except RuntimeError:
+                skipped += 1
+        self.report(
+            {"WARNING"} if skipped else {"INFO"},
+            f"Renamed {renamed}; skipped {skipped} non-editable or out-of-scene objects.",
+        )
         return {"FINISHED"}
 
 
-class SCMFREE_OT_hide_empty_collections(bpy.types.Operator):
+class SCMFREE_OT_hide_empty_collections(SceneOperator, bpy.types.Operator):
     bl_idname = "smart_collection_free.hide_empty"
     bl_label = "Hide Empty Collections"
+    bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        hidden = 0
-        for collection in bpy.data.collections:
-            if not collection_has_content(collection):
-                collection.hide_viewport = True
-                hidden += 1
+        hidden = hide_empty(context.scene, context.scene.scm_hidden_collections)
         self.report({"INFO"}, "Hidden " + str(hidden) + " empty collections.")
         return {"FINISHED"}
 
 
-class SCMFREE_OT_show_all_collections(bpy.types.Operator):
+class SCMFREE_OT_show_all_collections(SceneOperator, bpy.types.Operator):
     bl_idname = "smart_collection_free.show_all"
-    bl_label = "Show Collections"
+    bl_label = "Restore Hidden Collections"
+    bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        for collection in bpy.data.collections:
-            collection.hide_viewport = False
+        restored, retained = restore_hidden(context.scene, context.scene.scm_hidden_collections)
+        self.report(
+            {"WARNING"} if retained else {"INFO"},
+            f"Restored {restored}; retained {retained} protected visibility records.",
+        )
         return {"FINISHED"}
 
 
-class SCMFREE_OT_stats_report(bpy.types.Operator):
+class SCMFREE_OT_stats_report(SceneOperator, bpy.types.Operator):
     bl_idname = "smart_collection_free.stats_report"
     bl_label = "Write Stats Report"
+    bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         scene = context.scene
@@ -146,16 +151,14 @@ class SCMFREE_OT_stats_report(bpy.types.Operator):
             "Smart Collection Manager Free - Scene Stats",
             "Scene: " + scene.name,
             "Objects: " + str(len(scene.objects)),
-            "Collections: " + str(len(bpy.data.collections)),
-            "Materials: " + str(len(bpy.data.materials)),
+            "Collections (file): " + str(len(bpy.data.collections)),
+            "Materials (file): " + str(len(bpy.data.materials)),
             "",
         ]
         for obj_type in sorted(counts):
             lines.append(obj_type.title() + ": " + str(counts[obj_type]))
-        text = bpy.data.texts.get("Smart_Collection_Stats") or bpy.data.texts.new("Smart_Collection_Stats")
-        text.clear()
-        text.write("\n".join(lines))
-        self.report({"INFO"}, "Scene stats written to Smart_Collection_Stats.")
+        text = write_report("Smart_Collection_Stats_Free", "\n".join(lines), OWNER)
+        self.report({"INFO"}, "Scene stats written to " + text.name + ".")
         return {"FINISHED"}
 
 
@@ -174,7 +177,7 @@ class SCMFREE_PT_panel(bpy.types.Panel):
         layout.label(text="Scene Stats", icon="INFO")
         row = layout.row(align=True)
         row.label(text="Objects: " + str(len(scene.objects)))
-        row.label(text="Collections: " + str(len(bpy.data.collections)))
+        row.label(text="Collections (file): " + str(len(bpy.data.collections)))
         layout.label(text="Meshes: " + str(stats.get("MESH", 0)) + "  Lights: " + str(stats.get("LIGHT", 0)) + "  Cameras: " + str(stats.get("CAMERA", 0)))
         layout.operator("smart_collection_free.stats_report", icon="TEXT")
 
@@ -199,6 +202,7 @@ class SCMFREE_PT_panel(bpy.types.Panel):
 
 
 classes = (
+    SCMFREE_HiddenCollection,
     SCMFREE_OT_sort_by_type,
     SCMFREE_OT_rename_objects,
     SCMFREE_OT_hide_empty_collections,
@@ -211,7 +215,11 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.scm_exclusive_sort = BoolProperty(name="Exclusive Sort", default=False)
+    bpy.types.Scene.scm_hidden_collections = CollectionProperty(type=SCMFREE_HiddenCollection)
+    bpy.types.Scene.scm_exclusive_sort = BoolProperty(
+        name="Exclusive Sort", default=False,
+        description="Unlink only editable scene-private memberships; preserve shared and linked collections",
+    )
     bpy.types.Scene.scm_rename_selected_only = BoolProperty(name="Selected Only", default=True)
     bpy.types.Scene.scm_prefix = StringProperty(name="Prefix", default="")
     bpy.types.Scene.scm_suffix = StringProperty(name="Suffix", default="")
@@ -221,6 +229,7 @@ def register():
 
 
 def unregister():
+    del bpy.types.Scene.scm_hidden_collections
     del bpy.types.Scene.scm_zero_pad
     del bpy.types.Scene.scm_replace
     del bpy.types.Scene.scm_search

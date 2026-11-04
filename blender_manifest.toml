@@ -1,0 +1,9 @@
+schema_version = "1.0.0"
+id = "smart_collection_manager_free"
+version = "1.1.1"
+name = "Smart Collection Manager Free"
+tagline = "Sort and manage scene collections"
+maintainer = "NitroBlitzCoder"
+type = "add-on"
+blender_version_min = "5.0.0"
+license = ["SPDX:GPL-3.0-or-later"]
